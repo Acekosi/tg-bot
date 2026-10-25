@@ -107,10 +107,12 @@ def reset_strikes(chat_id: int, user_id: int):
 # --- HELPER FUNCTIONS ---
 
 async def is_user_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Returns True if the sender is a group admin, creator, or anonymous admin."""
     message = update.effective_message
     chat = update.effective_chat
     user = update.effective_user
 
+    # Anonymous group admin or linked channel post
     if message.sender_chat and message.sender_chat.id == chat.id:
         return True
 
@@ -126,6 +128,7 @@ async def is_user_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> b
 
 
 def contains_unapproved_link(text: str, entities: tuple) -> bool:
+    """Checks both Telegram's native entities and regex for non-whitelisted links."""
     for entity in entities:
         if entity.type in (MessageEntity.URL, MessageEntity.TEXT_LINK):
             url = (
@@ -146,11 +149,29 @@ def contains_unapproved_link(text: str, entities: tuple) -> bool:
 
 
 def contains_ad_content(text: str) -> bool:
+    """Checks if the text contains common advertising phrases."""
     text_lower = text.lower()
     return any(keyword in text_lower for keyword in AD_KEYWORDS)
 
 
+def contains_chinese_or_handle_spam(text: str, entities: tuple) -> bool:
+    """Catches Chinese lottery/group spam and promo messages pushing external @handles."""
+    # 1. Flag Chinese characters commonly used in Telegram bot spam (e.g., 进裙 / 抽奖)
+    if re.search(r"[\u4e00-\u9fff]", text):
+        return True
+
+    # 2. Flag @mentions combined with promotional call-to-action words
+    for entity in entities:
+        if entity.type == MessageEntity.MENTION:
+            promo_triggers = ["dm ", "message ", "contact ", "join ", "check ", "add ", "inbox "]
+            if any(trigger in text.lower() for trigger in promo_triggers):
+                return True
+
+    return False
+
+
 async def auto_delete_message(message, delay: int = 10):
+    """Deletes a bot warning message after a few seconds to keep topics clean."""
     await asyncio.sleep(delay)
     try:
         await message.delete()
@@ -161,6 +182,7 @@ async def auto_delete_message(message, delay: int = 10):
 # --- BOT HANDLERS ---
 
 async def unwarn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command: Reply to a user's message with /unwarn to reset strikes and unmute."""
     if not await is_user_admin(update, context):
         return
 
@@ -205,29 +227,61 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not message or not chat or not user:
         return
 
+    # Ignore messages from the moderation bot itself
+    if user.id == context.bot.id:
+        return
+
+    # Let group admins (including admin bots you explicitly promoted) post freely
     if await is_user_admin(update, context):
         return
 
+    # --- CHECK 0: DELETE MESSAGES FROM OTHER BOTS OR INLINE BOTS ---
+    if user.is_bot or message.via_bot:
+        try:
+            await message.delete()
+            bot_name = user.username if user.is_bot else message.via_bot.username
+            logger.info(f"Deleted bot/inline message from @{bot_name} in {chat.title}.")
+
+            # If a regular user triggered an inline spam bot (via @bot), give that user a strike too
+            if not user.is_bot and message.via_bot:
+                reason = f"using unauthorized inline bot (@{message.via_bot.username})"
+            else:
+                # If an external bot directly sent the message, just delete it silently
+                return
+        except Exception as e:
+            logger.error(f"Failed to delete external bot message in {chat.title}: {e}")
+            return
+    else:
+        reason = None
+
+    # --- CONTENT CHECKS FOR REGULAR USERS ---
     text_content = message.text or message.caption or ""
     entities = message.entities or message.caption_entities or ()
 
-    reason = None
-
-    if message.forward_origin and message.forward_origin.type == "channel":
-        reason = "forwarding channel posts"
-    elif contains_unapproved_link(text_content, entities):
-        reason = "posting unauthorized links"
-    elif contains_ad_content(text_content):
-        reason = "advertising / promotional content"
+    if not reason:
+        if message.forward_origin and message.forward_origin.type == "channel":
+            reason = "forwarding channel posts"
+        elif contains_unapproved_link(text_content, entities):
+            reason = "posting unauthorized links"
+        elif contains_ad_content(text_content):
+            reason = "advertising / promotional content"
+        elif contains_chinese_or_handle_spam(text_content, entities):
+            reason = "unsolicited promotion / spam"
 
     if not reason:
         return
 
     raw_mention = f"@{user.username}" if user.username else user.first_name
     safe_mention = escape_markdown(raw_mention, version=1)
+    topic_id = message.message_thread_id  # Ensures warnings stay in the right Forum Topic
 
     try:
-        await message.delete()
+        # Delete the offending message (if not already deleted by the via_bot check)
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
         current_strikes = add_strike(chat.id, user.id)
         logger.info(f"Strike {current_strikes}/{MAX_STRIKES} for {raw_mention} in {chat.title} ({reason}).")
 
@@ -245,9 +299,10 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             mute_notice = await context.bot.send_message(
                 chat_id=chat.id,
+                message_thread_id=topic_id,
                 text=(
                     f"🔇 {raw_mention} reached {MAX_STRIKES}/{MAX_STRIKES} strikes "
-                    f"for {reason} and has been muted for {MUTE_DURATION_HOURS} hours."
+                    f"for {reason} and has been muted across all topics for {MUTE_DURATION_HOURS} hours."
                 ),
             )
             asyncio.create_task(auto_delete_message(mute_notice, delay=15))
@@ -255,6 +310,7 @@ async def moderate_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             warning = await context.bot.send_message(
                 chat_id=chat.id,
+                message_thread_id=topic_id,
                 text=(
                     f"⚠️ {safe_mention}, your message was removed ({reason} is not allowed).\n"
                     f"Strike *{current_strikes}/{MAX_STRIKES}* — {MAX_STRIKES} strikes results in a 24-hour mute."
